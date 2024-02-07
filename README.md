@@ -3,6 +3,10 @@
 ## Overview
 This Python script is designed to assist email system administrators and cybersecurity professionals using GreenArrowEmail.com in identifying potential spamtrap interactions within their email logs. By leveraging the `hvmail_get_possible_spamtrap_hits` command, the script scans for emails sent from a specified IP address over a designated date and time range, extracting email addresses that may be spamtraps.
 
+For more information on the `hvmail_get_possible_spamtrap_hits` command, including its usage, options, and understanding its output, please visit the official GreenArrow documentation:
+[GreenArrow Engine Reporting](https://www.greenarrowemail.com/docs/greenarrow-engine/Reporting/hvmail-get-possible-spamtrap-hits-Command)
+
+
 ## Features
 - Automates the detection of possible spamtrap hits from specified IP addresses.
 - Configurable date and time range for targeted analysis.
