@@ -111,3 +111,5 @@ python -m unittest discover -s tests -v
 ```
 
 CI checks Python 3.10–3.14 on Linux and Python 3.14 on Windows, including installation and the CLI entry point. The Linux runs also exercise daylight-saving transitions. Tests require no GreenArrow installation, mail logs, or network access.
+
+CI also runs Gitleaks against the complete fetched Git history. The scanner download is pinned and checksum-verified; findings are redacted. Local `.env` files and common private-key containers are ignored by Git.

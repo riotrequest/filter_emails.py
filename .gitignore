@@ -8,3 +8,11 @@ dist/
 # Reports contain recipient data; keep them out of Git.
 email_addresses.csv
 reports/
+# Local credentials and private key containers.
+.env
+.env.*
+!.env.example
+!.env.sample
+*.key
+*.p12
+*.pfx
