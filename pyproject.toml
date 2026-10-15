@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "greenarrow-spamtrap-review"
+version = "1.0.0"
+description = "Collect GreenArrow possible-spamtrap review evidence across multiple time ranges and IPs"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+greenarrow-spamtrap-review = "filter_emails:main"
+
+[tool.setuptools]
+py-modules = ["filter_emails"]

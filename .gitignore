@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+*.egg-info/
+.coverage
+# Reports contain recipient data; keep them out of Git.
+email_addresses.csv
+reports/
