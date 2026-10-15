@@ -3,6 +3,7 @@ import csv
 import io
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -121,6 +122,87 @@ class PlanningTests(unittest.TestCase):
 
 
 class ScanTests(unittest.TestCase):
+    def test_all_ip_summary_collection_and_missing_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "summary.db"
+            with contextlib.closing(sqlite3.connect(path)) as database:
+                database.executescript("""
+                    CREATE TABLE domainid (id INTEGER, domain TEXT);
+                    CREATE TABLE status_messages (id INTEGER, message TEXT);
+                    CREATE TABLE messages (injtime INTEGER, msguid TEXT, localpart TEXT,
+                        domain INTEGER, smtp_result_code INTEGER, smtp_result_time INTEGER,
+                        smtp_result_smsgid INTEGER, smtp_result_outmtaid TEXT);
+                    INSERT INTO domainid VALUES (1, 'example.com');
+                    INSERT INTO status_messages VALUES (1, '250 accepted');
+                    INSERT INTO messages VALUES (90, '1', 'first', 1, 1, 100, 1, 10);
+                    INSERT INTO messages VALUES (90, '2', 'second', 1, 2, 150, 1, 20);
+                    INSERT INTO messages VALUES (90, '3', 'outside', 1, 1, 200, 1, 10);
+                    INSERT INTO messages VALUES (90, '4', 'unconfigured', 1, 1, 150, 1, 30);
+                    INSERT INTO messages VALUES (90, '5', 'unbound', 1, 1, 150, 1, 40);
+                """)
+                database.commit()
+            original = path.read_bytes()
+            inventory = {
+                "ips": [[10, "192.0.2.1"], [20, "192.0.2.2"]],
+                "summaries": [{"path": str(path), "sendid": "sample"}],
+            }
+            rows = app.scan_summaries(inventory, [(100, 200)])
+            self.assertEqual(len(rows), 2)
+            self.assertEqual({row["ip"] for row in rows}, {"192.0.2.1", "192.0.2.2"})
+            self.assertIn("smtp_result=<failed>", rows[1]["raw"])
+            self.assertEqual(path.read_bytes(), original)
+            inventory["relays"] = [
+                [30, "smtp.example.com", "192.0.2.1"],
+                [40, "unbound.example.com", None],
+            ]
+            relay_rows = app.scan_summaries(
+                inventory, [(100, 200)], include_relays=True
+            )
+            self.assertEqual(len(relay_rows), 4)
+            self.assertEqual(sum(row["route_type"] == "relay" for row in relay_rows), 2)
+            self.assertEqual(
+                next(row for row in relay_rows if row["outmtaid"] == "40")["ip"], None
+            )
+            missing = Path(directory) / "missing.db"
+            inventory["summaries"].append({"path": str(missing), "sendid": "missing"})
+            with self.assertRaises(app.ScanError):
+                app.scan_summaries(inventory, [(100, 200)])
+            failures = []
+            self.assertEqual(
+                len(app.scan_summaries(inventory, [(100, 200)], failures)), 2
+            )
+            self.assertEqual(len(failures), 1)
+            self.assertFalse(missing.exists())
+
+    def test_native_progress_is_not_an_error(self):
+        command = [
+            "binary",
+            "--dd-mm-yyyy-timestamp",
+            "01/10/2026 09:00:59",
+            "192.0.2.1",
+        ]
+        progress = (
+            "==================================================== 01/10/2026 09:00:59 192.0.2.1\n"
+            "checking sendid (example-send) 1/2\n"
+            "send_summary_filename = /var/hvmail/summary/example.sqlite\n"
+        )
+        result = subprocess.CompletedProcess(command, 0, legacy(), progress)
+        with patch.object(app.subprocess, "run", return_value=result):
+            self.assertEqual(len(app.run_query(command, 1)), 1)
+        for diagnostic in (
+            "send summary file for sendid=(example-send) does not exist\n",
+            "missing 3600 seconds\n",
+            "unexpected warning\n",
+        ):
+            result = subprocess.CompletedProcess(
+                command, 0, legacy(), progress + diagnostic
+            )
+            with (
+                patch.object(app.subprocess, "run", return_value=result),
+                self.assertRaises(app.ScanError),
+            ):
+                app.run_query(command, 1)
+
     def test_exact_boundaries_dedup_and_distinct_deliveries(self):
         base = app.parse_time("2026-10-01 09:00")
         records = []
@@ -196,6 +278,25 @@ class CliTests(unittest.TestCase):
         run.assert_not_called()
         self.assertFalse(self.output.exists())
         self.assertEqual(len(output.getvalue().splitlines()), 3)
+
+    def test_all_ip_cli_uses_summary_backend(self):
+        inventory = {"ips": [[10, "192.0.2.1"]], "relays": [], "summaries": []}
+        with (
+            patch.object(app, "summary_inventory", return_value=inventory),
+            patch.object(app, "scan_summaries", return_value=[]) as scan,
+        ):
+            self.assertEqual(
+                self.run_main(
+                    self.arguments[2:]
+                    + ["--all-ips", "--include-relays", "--format", "json"]
+                ),
+                0,
+            )
+        self.assertTrue(scan.call_args.args[-1])
+        report = json.loads(self.output.read_text(encoding="utf-8"))
+        self.assertEqual(report["ips"], ["192.0.2.1"])
+        self.assertEqual(report["collection_method"], "send_summaries")
+        self.assertTrue(report["includes_relays"])
 
     def test_invalid_arguments(self):
         for extra in (
