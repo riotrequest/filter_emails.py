@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 import ipaddress
 import json
@@ -12,6 +13,7 @@ import math
 import os
 import re
 import shlex
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -23,6 +25,46 @@ from typing import TextIO
 DEFAULT_COMMAND = "/var/hvmail/bin/hvmail_get_possible_spamtrap_hits"
 QUERY_STEP = 179  # One-second overlap avoids depending on endpoint inclusivity.
 LOG = logging.getLogger("filter_emails")
+
+# Use GreenArrow's installed database/time/path helpers, without exposing credentials.
+# This inventory query reads metadata only; recipient data stays in read-only SQLite.
+SUMMARY_INVENTORY = r"""
+use HVMail::Database;
+use HVMail::Time;
+use HVMail::Util;
+use JSON::PP;
+my ($start, $end) = @ARGV;
+my $dbh = HVMail::Database::connect();
+$dbh->rollback();
+$dbh->do('SET TRANSACTION READ ONLY');
+my $ips = $dbh->selectall_arrayref('SELECT id, ipaddr FROM mr_ipaddr ORDER BY id');
+my $relays = $dbh->selectall_arrayref('SELECT id, server, out_ipaddr FROM mr_relay ORDER BY id');
+my $first = $dbh->quote(HVMail::Time::unix_to_tai($start));
+my $last = $dbh->quote(HVMail::Time::unix_to_tai($end));
+my $sends = $dbh->selectall_arrayref(qq[
+    SELECT id, sendid FROM sends WHERE
+    ($first <= ram_last AND $last >= ram_first) OR
+    ($first <= disk_last AND $last >= disk_first) OR
+    ($first <= bounce_last AND $last >= bounce_first)
+    ORDER BY id
+]);
+my @summaries = map {
+    {sendid => $_->[1], path => HVMail::Util::get_send_summary_filename($_->[0], 0)}
+} @$sends;
+$dbh->rollback();
+$dbh->disconnect();
+print encode_json({ips => $ips, relays => $relays, summaries => \@summaries});
+"""
+
+SUMMARY_SQL = """
+SELECT localpart, domainid.domain, smtp_result_code,
+       CAST(smtp_result_time AS TEXT), status_messages.message, smtp_result_outmtaid
+FROM messages
+LEFT JOIN status_messages ON status_messages.id = messages.smtp_result_smsgid
+LEFT JOIN domainid ON domainid.id = messages.domain
+WHERE ? <= smtp_result_time AND smtp_result_time < ?
+ORDER BY injtime, msguid
+"""
 
 
 class ScanError(Exception):
@@ -153,12 +195,139 @@ def run_query(command: list[str], timeout: float) -> set[tuple[str, Decimal, str
         raise ScanError(
             f"GreenArrow exited with status {result.returncode}: {result.stderr.strip()}"
         )
-    # Treat stderr conservatively: warnings can mean missing logs or lost coverage.
-    if result.stderr.strip():
+    # The native command logs these progress lines even on successful queries.
+    # Unknown diagnostics (including missing summary files) still fail closed.
+    progress = (
+        rf"={{4,}} {re.escape(command[-2])} {re.escape(command[-1])}",
+        r"checking sendid \([^\r\n]*\) \d+/\d+",
+        r"send_summary_filename = /[^\r\n]+",
+    )
+    diagnostics = [
+        line
+        for line in result.stderr.splitlines()
+        if line.strip() and not any(re.fullmatch(pattern, line) for pattern in progress)
+    ]
+    if diagnostics:
         raise ScanError(
-            f"GreenArrow wrote diagnostics to stderr: {result.stderr.strip()}"
+            f"GreenArrow wrote diagnostics to stderr: {'; '.join(diagnostics)}"
         )
     return parse_report(result.stdout)
+
+
+def summary_inventory(windows: list[tuple[int, int]], timeout: float) -> dict:
+    try:
+        result = subprocess.run(
+            [
+                "/var/hvmail/libexec/perl",
+                "-I/var/hvmail/perllib",
+                "-e",
+                SUMMARY_INVENTORY,
+                str(windows[0][0]),
+                str(windows[-1][1]),
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ScanError("GreenArrow summary inventory timed out") from exc
+    if result.returncode or result.stderr.strip():
+        raise ScanError(f"GreenArrow summary inventory failed: {result.stderr.strip()}")
+    inventory = json.loads(result.stdout)
+    if (
+        not isinstance(inventory, dict)
+        or not isinstance(inventory.get("ips"), list)
+        or not isinstance(inventory.get("summaries"), list)
+    ):
+        raise ScanError("invalid GreenArrow summary inventory")
+    if not inventory["ips"]:
+        raise ScanError("no sending IPs are configured in GreenArrow")
+    return inventory
+
+
+def scan_summaries(
+    inventory: dict,
+    windows: list[tuple[int, int]],
+    failures: list[dict[str, str]] | None = None,
+    include_relays: bool = False,
+) -> list[dict[str, str]]:
+    """Collect the native command's last-result evidence in one pass for all IPs."""
+    ips = {str(key): str(ipaddress.ip_address(ip)) for key, ip in inventory["ips"]}
+    relays = {}
+    if include_relays:
+        for key, server, bound_ip in inventory.get("relays", []):
+            route_id = str(key)
+            ips[route_id] = str(ipaddress.ip_address(bound_ip)) if bound_ip else None
+            relays[route_id] = str(server)
+    results: dict[tuple[str, str], dict[str, str]] = {}
+    status_names = {
+        1: "accepted",
+        2: "failed",
+        3: "expired",
+        4: "deferred",
+        5: "deferred_throttle",
+    }
+    for index, summary in enumerate(inventory["summaries"], 1):
+        path = Path(summary["path"])
+        LOG.info("Summary %d/%d: %s", index, len(inventory["summaries"]), path)
+        try:
+            # URI mode=ro refuses missing files and prevents creating/modifying databases.
+            with contextlib.closing(
+                sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+            ) as database:
+                for (
+                    localpart,
+                    domain,
+                    status,
+                    timestamp,
+                    message,
+                    outmtaid,
+                ) in database.execute(SUMMARY_SQL, (windows[0][0], windows[-1][1])):
+                    outmtaid = str(outmtaid)
+                    if outmtaid not in ips or not any(
+                        start <= Decimal(timestamp) < end for start, end in windows
+                    ):
+                        continue
+                    raw = (
+                        f"email=<{localpart}@{domain}> smtp_result_time=<{timestamp}> "
+                        f"smtp_result=<{status_names.get(status, status)}> "
+                        f"smtp_result_message=<{message or ''}> sendid=<{summary['sendid']}>"
+                    )
+                    # Share the same validation and record representation as native lookups.
+                    records = parse_report(raw)
+                    for email, epoch, line in records:
+                        ip = ips[outmtaid]
+                        results[(outmtaid, line)] = {
+                            "ip": ip,
+                            "email": email,
+                            "timestamp": str(epoch),
+                            "raw": line,
+                            "outmtaid": outmtaid,
+                            "route_type": "relay" if outmtaid in relays else "direct",
+                            "relay_server": relays.get(outmtaid),
+                        }
+        except (OSError, sqlite3.Error, ScanError, ValueError) as exc:
+            if failures is None:
+                raise ScanError(f"summary {path}: {exc}") from exc
+            failures.append(
+                {
+                    "summary_file": str(path),
+                    "sendid": str(summary["sendid"]),
+                    "error": str(exc),
+                }
+            )
+            LOG.warning("Summary unavailable or incomplete: %s: %s", path, exc)
+    return sorted(
+        results.values(),
+        key=lambda row: (
+            row["ip"] or "",
+            Decimal(row["timestamp"]),
+            row["email"],
+            row["raw"],
+        ),
+    )
 
 
 def scan(
@@ -222,6 +391,10 @@ def write_report(
                 "deliveries": deliveries,
                 "complete": not args.failures,
                 "failed_queries": args.failures,
+                "collection_method": "send_summaries"
+                if args.all_ips
+                else "native_window_queries",
+                "includes_relays": args.include_relays,
                 "windows": [
                     {"start_epoch": start, "end_epoch_exclusive": end}
                     for start, end in windows
@@ -287,11 +460,21 @@ def build_parser() -> argparse.ArgumentParser:
         description=__doc__,
         epilog="Times use the GreenArrow server's local timezone; window ends are exclusive.",
     )
-    parser.add_argument(
+    targets = parser.add_mutually_exclusive_group(required=True)
+    targets.add_argument(
         "--ip",
         action="append",
-        required=True,
         help="sending IP; repeat for multiple IPs",
+    )
+    targets.add_argument(
+        "--all-ips",
+        action="store_true",
+        help="collect all configured IPs in one read-only pass through GreenArrow send summaries",
+    )
+    parser.add_argument(
+        "--include-relays",
+        action="store_true",
+        help="with --all-ips, also collect configured SMTP relay routes; ip is their local connection source, not the provider's delivery IP",
     )
     parser.add_argument(
         "--window",
@@ -355,7 +538,9 @@ def main(argv: list[str] | None = None) -> int:
         format="%(levelname)s: %(message)s",
     )
     try:
-        args.ip = list(dict.fromkeys(str(ipaddress.ip_address(ip)) for ip in args.ip))
+        args.ip = list(
+            dict.fromkeys(str(ipaddress.ip_address(ip)) for ip in args.ip or [])
+        )
         windows = merge_windows(
             [(parse_time(start), parse_time(end)) for start, end in args.window]
         )
@@ -367,20 +552,52 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError(
                 "--allow-partial requires --format json so coverage failures remain visible"
             )
+        if args.include_relays and not args.all_ips:
+            raise ValueError("--include-relays requires --all-ips")
     except (ValueError, OverflowError, OSError) as exc:
         parser.error(str(exc))
     try:
+        inventory = summary_inventory(windows, args.timeout) if args.all_ips else None
+        if inventory is not None:
+            args.ip = list(
+                dict.fromkeys(
+                    str(ipaddress.ip_address(ip)) for _, ip in inventory["ips"]
+                )
+            )
         if args.dry_run:
+            if inventory is not None:
+                print(
+                    json.dumps(
+                        {
+                            "ips": args.ip,
+                            "relays": inventory.get("relays", [])
+                            if args.include_relays
+                            else [],
+                            "summaries": inventory["summaries"],
+                        },
+                        indent=2,
+                    )
+                )
+                return 0
             for command in commands(args.command, args.ip, windows):
                 print(shlex.join(command))
             return 0
         args.failures = []
-        deliveries = scan(
-            args.command,
-            args.ip,
-            windows,
-            args.timeout,
-            args.failures if args.allow_partial else None,
+        deliveries = (
+            scan_summaries(
+                inventory,
+                windows,
+                args.failures if args.allow_partial else None,
+                args.include_relays,
+            )
+            if inventory is not None
+            else scan(
+                args.command,
+                args.ip,
+                windows,
+                args.timeout,
+                args.failures if args.allow_partial else None,
+            )
         )
         save_report(deliveries, args, windows)
         count = len({row["email"] for row in deliveries})
