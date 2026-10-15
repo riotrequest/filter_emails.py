@@ -6,6 +6,19 @@ GreenArrow's [`hvmail_get_possible_spamtrap_hits`](https://www.greenarrowemail.c
 
 **Results are review candidates.** The native command selects deliveries by IP and time; an address appearing in the results is not proof that it is a spamtrap.
 
+## Built for investigations
+
+| Need | What this gives you |
+| --- | --- |
+| Search beyond one timestamp | Repeatable ranges covering minutes, days, or separated incidents |
+| Follow multiple sending IPs | One run across all selected IPs and ranges |
+| Keep the evidence | JSON retains every distinct returned delivery line and its source IP |
+| Review a clean address list | Sorted, deduplicated CSV without losing the detailed JSON option |
+| Salvage available data | Explicit partial reports identify every failed lookup |
+| Run it reliably | Validated inputs, dry runs, progress, timeouts, and atomic report replacement |
+
+**For the richest collection, choose `--format json`.** CSV is the compact address export; JSON is the investigation record.
+
 ## Quick start
 
 Run on the Linux server that has GreenArrow installed and can read its delivery logs:
@@ -46,6 +59,30 @@ Every IP is scanned against every window. Duplicate IPs and overlapping or adjac
 | `--format csv` (default) | Sorted unique addresses, one per CSV row, without a header; defaults to `email_addresses.csv` |
 
 JSON retains original report lines so fields such as SendID, delivery result, SMTP response, and any additional fields present in the native output survive collection. Exact duplicate lines for the same IP are removed; different lines for the same recipient remain separate records. Address spelling and case are preserved. This does not infer separate events from byte-identical native records.
+
+A JSON report includes the following fields (abridged example using synthetic data):
+
+```json
+{
+  "candidate_count": 1,
+  "emails": ["person@example.com"],
+  "ips": ["192.0.2.10"],
+  "delivery_count": 1,
+  "deliveries": [
+    {
+      "ip": "192.0.2.10",
+      "email": "person@example.com",
+      "timestamp": "1790845259.1234",
+      "raw": "email=<person@example.com> smtp_result_time=<1790845259.1234> smtp_result=<accepted> smtp_result_message=<> sendid=<example-send>"
+    }
+  ],
+  "complete": true,
+  "failed_queries": [],
+  "classification": "review_candidates_not_confirmed_spamtraps"
+}
+```
+
+The full report also includes `windows` with inclusive start and exclusive end epoch values. Delivery timestamps remain strings to preserve the precision of the native log.
 
 CSV example:
 
